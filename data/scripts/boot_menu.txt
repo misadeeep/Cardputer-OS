@@ -1,0 +1,12 @@
+COLOR 0000
+PRINT === SYSTEM OS v1.0 ===
+PRINT 1. Cargar Bruce (SD)
+PRINT 2. Editar Config
+PRINT 3. Crear Nuevo Script
+PRINT ======================
+PRINT Escribe comando EDIT...
+
+# Ahora el script termina y te deja en el loop o puedes poner un wait
+# Para este ejemplo, vamos a editar la config directamente si pulsa tecla
+WAIT
+EDIT /config.json
