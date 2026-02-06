@@ -1,6 +1,8 @@
 /**
- * M5 CARDPUTER OS - RELEASE 1.0 (I+D EDITION)
- * Features: Scripting, Modular Loader, Crash Recovery, Text Editor, File Browser.
+ * M5 CARDPUTER OS - RELEASE 1.1 (FINAL FIX)
+ * Cambios:
+ * 1. Definido KEY_ESC para evitar Error Code 1.
+ * 2. Añadido delay(50) en el editor para evitar parpadeo de pantalla.
  */
 
 #include <M5Cardputer.h>
@@ -13,13 +15,19 @@
 #include <map>
 #include <vector>
 
+// --- FIX DE COMPILACIÓN (AQUI ESTA LA LINEA QUE FALTABA) ---
+#define KEY_ESC 0x1B    
+#ifndef KEY_ENTER
+#define KEY_ENTER 13
+#endif
+// ----------------------------------------------------------
+
 // --- CONFIGURACIÓN ---
-#define KEY_ESC 0x1B  // <--- AÑADE ESTA LÍNEA AQUÍ
 #define SD_CS_PIN       40
 #define LED_PIN         21
 #define RECOVERY_BIN    "/recovery.bin"
 #define CRASH_LIMIT     3
-#define EDITOR_MAX_SIZE 4096 // Limite de 4KB para editar en RAM
+#define EDITOR_MAX_SIZE 4096 
 
 // --- OBJETOS ---
 Adafruit_NeoPixel statusLed(1, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -33,33 +41,39 @@ const uint32_t LED_WORK  = statusLed.Color(0, 0, 255);
 const uint32_t LED_OK    = statusLed.Color(0, 255, 0);
 const uint32_t LED_ERR   = statusLed.Color(255, 0, 0);
 
-// Declaraciones adelantadas
+// --- PROTOTIPOS (Vital para evitar errores) ---
+void checkSystemHealth();
+void watchdogTask(void * parameter);
 void executeScript(String filename);
+void runEditor(String filepath);
+String fileBrowser(String path);
 void drawStatusBar(String msg, uint16_t color);
+void cmd_print(String arg);
+void cmd_delay(String arg);
+void cmd_color(String arg);
+void cmd_wait(String arg);
+void cmd_load(String arg);
+void cmd_edit(String arg);
 
 // ==========================================
 // MODULO: FILE BROWSER & EDITOR
 // ==========================================
 
-// Helper para determinar sistema de archivos
 fs::FS* getFS(String path) {
-    if (path.startsWith("/sd/") || !path.startsWith("/")) return &SD; // Asumir SD si no empieza por / o explícito
-    return &LittleFS;
+    if (path.startsWith("/sd/") || !path.startsWith("/")) return &SD; 
+    return (fs::FS*)&LittleFS; 
 }
 
-// Explorador de Archivos Simple
 String fileBrowser(String path = "/") {
     M5Cardputer.Display.fillScreen(BLACK);
     M5Cardputer.Display.setTextSize(1);
     
-    fs::FS* fsPtr = &LittleFS; // Por defecto LittleFS
-    // Lógica simple: Si pulsas 'S' vas a SD, si pulsas 'L' a LittleFS (Podría mejorarse)
-    
+    fs::FS* fsPtr = (fs::FS*)&LittleFS;
+    if(path.startsWith("/sd/")) fsPtr = &SD;
+
     std::vector<String> files;
     File root = fsPtr->open(path);
-    if(!root || !root.isDirectory()){
-         return "";
-    }
+    if(!root || !root.isDirectory()) return "";
 
     File file = root.openNextFile();
     while(file){
@@ -74,7 +88,7 @@ String fileBrowser(String path = "/") {
     
     while(true) {
         M5Cardputer.Display.fillScreen(BLACK);
-        drawStatusBar("BROWSER: " + path + " (UP/DWN/OK)", TFT_BLUE);
+        drawStatusBar("BROWSER: " + path, TFT_BLUE);
         
         for(int i=0; i<8; i++) {
             int idx = offset + i;
@@ -89,17 +103,17 @@ String fileBrowser(String path = "/") {
 
         M5Cardputer.update();
         if(M5Cardputer.Keyboard.isChange()) {
-            if(M5Cardputer.Keyboard.isKeyPressed(';')) { // Up (Flecha arriba es ; con Fn, o usar mapeo directo)
+            if(M5Cardputer.Keyboard.isKeyPressed(';')) { 
                if(selected > 0) selected--;
                if(selected < offset) offset--;
             }
-            if(M5Cardputer.Keyboard.isKeyPressed('.')) { // Down
+            if(M5Cardputer.Keyboard.isKeyPressed('.')) { 
                if(selected < files.size()-1) selected++;
                if(selected >= offset+8) offset++;
             }
             if(M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
                 String choice = files[selected];
-                if(choice.endsWith("/")) return fileBrowser(path + choice); // Recursivo
+                if(choice.endsWith("/")) return fileBrowser(path + choice); 
                 return path + (path == "/" ? "" : "/") + choice;
             }
             if(M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) return "";
@@ -107,63 +121,42 @@ String fileBrowser(String path = "/") {
     }
 }
 
-// EDITOR DE TEXTO EN RAM
 void runEditor(String filepath) {
-    fs::FS* fs = (filepath.startsWith("/sd") || !LittleFS.exists(filepath)) ? (fs::FS*)&SD : (fs::FS*)&LittleFS;
+    fs::FS* fs = getFS(filepath);
     
-    // 1. Cargar Archivo
     String buffer = "";
     if(fs->exists(filepath)) {
         File f = fs->open(filepath, "r");
         while(f.available()) buffer += (char)f.read();
         f.close();
-    } else {
-        buffer = ""; // Nuevo archivo
     }
 
-    int cursor = buffer.length(); // Empezar al final
-    int scrollY = 0;
     bool dirty = false;
 
     while(true) {
-        // Renderizado
         M5Cardputer.Display.fillScreen(BLACK);
         drawStatusBar("EDIT: " + filepath + (dirty?"*":""), dirty ? TFT_ORANGE : TFT_DARKGREY);
-        
         M5Cardputer.Display.setTextColor(WHITE);
         M5Cardputer.Display.setCursor(0, 20);
-        
-        // "Viewport" simple: mostramos los ultimos caracteres si el buffer es largo
-        // Para I+D simple, mostramos todo y confiamos en el wrap
         M5Cardputer.Display.print(buffer);
-        
-        // Dibujar Cursor (un guión bajo parpadeante o bloque)
         if((millis()/500)%2==0) M5Cardputer.Display.print("_");
 
-        // Input Loop
         M5Cardputer.update();
         if(M5Cardputer.Keyboard.isChange()) {
             if(M5Cardputer.Keyboard.isPressed()) {
                 Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
                 
                 for(auto i : status.word) {
-                    buffer += i;
-                    dirty = true;
+                    buffer += i; dirty = true;
                 }
-                
                 if(status.del && buffer.length() > 0) {
-                    buffer.remove(buffer.length()-1);
-                    dirty = true;
+                    buffer.remove(buffer.length()-1); dirty = true;
                 }
-                
                 if(status.enter) {
-                    buffer += "\n";
-                    dirty = true;
+                    buffer += "\n"; dirty = true;
                 }
             }
             
-            // Comandos Especiales (Combinaciones)
-            // ESC para salir/guardar
             if(M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) {
                 M5Cardputer.Display.fillScreen(BLUE);
                 M5Cardputer.Display.setCursor(10,50);
@@ -172,19 +165,20 @@ void runEditor(String filepath) {
                     M5Cardputer.update();
                     if(M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
                         File f = fs->open(filepath, "w");
-                        f.print(buffer);
-                        f.close();
+                        f.print(buffer); f.close();
                         return;
                     }
                     if(M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) return;
                 }
             }
         }
+        // --- FIX PARPADEO ---
+        delay(50); // Esta pequeña pausa evita que la pantalla se vuelva loca
     }
 }
 
 // ==========================================
-// MODULO: CORE SYSTEM
+// CORE SYSTEM
 // ==========================================
 
 void drawStatusBar(String msg, uint16_t color) {
@@ -227,7 +221,7 @@ void watchdogTask(void * parameter) {
 }
 
 // ==========================================
-// COMANDOS INTERPRETE
+// COMANDOS
 // ==========================================
 
 void cmd_print(String arg) { M5Cardputer.Display.println(arg); }
@@ -248,12 +242,9 @@ void cmd_load(String arg) {
     }
     updateFromFS(SD, arg);
 }
-// NUEVO: Comando EDIT
 void cmd_edit(String arg) {
     runEditor(arg);
-    // Al salir del editor, restaurar pantalla negra
-    M5Cardputer.Display.fillScreen(BLACK);
-    M5Cardputer.Display.setCursor(0,0);
+    M5Cardputer.Display.fillScreen(BLACK); M5Cardputer.Display.setCursor(0,0);
 }
 
 // ==========================================
@@ -295,17 +286,15 @@ void setup() {
     if(!LittleFS.begin(true)) M5Cardputer.Display.println("LFS Fail");
     SD.begin(SD_CS_PIN, SPI, 25000000);
 
-    // REGISTRO DE COMANDOS
     cmdMap["PRINT"] = &cmd_print;
     cmdMap["DELAY"] = &cmd_delay;
     cmdMap["COLOR"] = &cmd_color;
     cmdMap["WAIT"]  = &cmd_wait;
     cmdMap["LOAD"]  = &cmd_load;
-    cmdMap["EDIT"]  = &cmd_edit; // <--- NUEVO
+    cmdMap["EDIT"]  = &cmd_edit;
 
     xTaskCreatePinnedToCore(watchdogTask, "WDT", 2048, NULL, 1, NULL, 1);
 
-    // Cargar Config
     String autoScript = "";
     File cfgFile = LittleFS.open("/config.json", "r");
     if(cfgFile) {
@@ -316,8 +305,7 @@ void setup() {
 
     if(autoScript.length() > 0) executeScript(autoScript);
     else {
-        // Fallback si no hay config: Lanzar editor directamente
-        M5Cardputer.Display.println("No Config. Starting Editor...");
+        M5Cardputer.Display.println("No Config. Editor...");
         delay(1000);
         runEditor("/config.json");
     }
