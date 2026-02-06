@@ -14,6 +14,7 @@
 #include <vector>
 
 // --- CONFIGURACIÓN ---
+#define KEY_ESC 0x1B  // <--- AÑADE ESTA LÍNEA AQUÍ
 #define SD_CS_PIN       40
 #define LED_PIN         21
 #define RECOVERY_BIN    "/recovery.bin"
