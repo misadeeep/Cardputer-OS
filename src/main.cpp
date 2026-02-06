@@ -1,8 +1,9 @@
 /**
- * M5 CARDPUTER OS - RELEASE 1.1 (FINAL FIX)
- * Cambios:
- * 1. Definido KEY_ESC para evitar Error Code 1.
- * 2. Añadido delay(50) en el editor para evitar parpadeo de pantalla.
+ * M5 CARDPUTER OS - RELEASE 1.2 (STABLE & FAST)
+ * Mejoras:
+ * - Fix de congelamiento (eliminado redibujado constante).
+ * - Watchdog simplificado (sin tareas paralelas).
+ * - Editor optimizado (solo actualiza si hay cambios).
  */
 
 #include <M5Cardputer.h>
@@ -15,38 +16,31 @@
 #include <map>
 #include <vector>
 
-// --- FIX DE COMPILACIÓN (AQUI ESTA LA LINEA QUE FALTABA) ---
+// --- FIX TECLA ESCAPE ---
 #define KEY_ESC 0x1B    
 #ifndef KEY_ENTER
 #define KEY_ENTER 13
 #endif
-// ----------------------------------------------------------
 
-// --- CONFIGURACIÓN ---
+// --- CONFIG ---
 #define SD_CS_PIN       40
 #define LED_PIN         21
 #define RECOVERY_BIN    "/recovery.bin"
 #define CRASH_LIMIT     3
-#define EDITOR_MAX_SIZE 4096 
 
-// --- OBJETOS ---
+// --- GLOBALES ---
 Adafruit_NeoPixel statusLed(1, LED_PIN, NEO_GRB + NEO_KHZ800);
 Preferences crashTracker;
 typedef void (*CmdHandler)(String arg);
 std::map<String, CmdHandler> cmdMap;
+unsigned long bootTime = 0;
+bool systemStabilized = false;
 
-// --- COLORES ---
-const uint32_t LED_BOOT  = statusLed.Color(50, 0, 50);
-const uint32_t LED_WORK  = statusLed.Color(0, 0, 255);
-const uint32_t LED_OK    = statusLed.Color(0, 255, 0);
-const uint32_t LED_ERR   = statusLed.Color(255, 0, 0);
-
-// --- PROTOTIPOS (Vital para evitar errores) ---
+// --- PROTOTIPOS ---
 void checkSystemHealth();
-void watchdogTask(void * parameter);
+void markSystemStable();
 void executeScript(String filename);
 void runEditor(String filepath);
-String fileBrowser(String path);
 void drawStatusBar(String msg, uint16_t color);
 void cmd_print(String arg);
 void cmd_delay(String arg);
@@ -56,99 +50,46 @@ void cmd_load(String arg);
 void cmd_edit(String arg);
 
 // ==========================================
-// MODULO: FILE BROWSER & EDITOR
+// FILE SYSTEM HELPER
 // ==========================================
-
 fs::FS* getFS(String path) {
     if (path.startsWith("/sd/") || !path.startsWith("/")) return &SD; 
     return (fs::FS*)&LittleFS; 
 }
 
-String fileBrowser(String path = "/") {
-    M5Cardputer.Display.fillScreen(BLACK);
-    M5Cardputer.Display.setTextSize(1);
-    
-    fs::FS* fsPtr = (fs::FS*)&LittleFS;
-    if(path.startsWith("/sd/")) fsPtr = &SD;
-
-    std::vector<String> files;
-    File root = fsPtr->open(path);
-    if(!root || !root.isDirectory()) return "";
-
-    File file = root.openNextFile();
-    while(file){
-        String name = String(file.name());
-        if(file.isDirectory()) name += "/";
-        files.push_back(name);
-        file = root.openNextFile();
-    }
-    
-    int selected = 0;
-    int offset = 0;
-    
-    while(true) {
-        M5Cardputer.Display.fillScreen(BLACK);
-        drawStatusBar("BROWSER: " + path, TFT_BLUE);
-        
-        for(int i=0; i<8; i++) {
-            int idx = offset + i;
-            if(idx >= files.size()) break;
-            
-            if(idx == selected) M5Cardputer.Display.setTextColor(BLACK, WHITE);
-            else M5Cardputer.Display.setTextColor(WHITE, BLACK);
-            
-            M5Cardputer.Display.setCursor(5, 20 + (i*15));
-            M5Cardputer.Display.println(files[idx]);
-        }
-
-        M5Cardputer.update();
-        if(M5Cardputer.Keyboard.isChange()) {
-            if(M5Cardputer.Keyboard.isKeyPressed(';')) { 
-               if(selected > 0) selected--;
-               if(selected < offset) offset--;
-            }
-            if(M5Cardputer.Keyboard.isKeyPressed('.')) { 
-               if(selected < files.size()-1) selected++;
-               if(selected >= offset+8) offset++;
-            }
-            if(M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
-                String choice = files[selected];
-                if(choice.endsWith("/")) return fileBrowser(path + choice); 
-                return path + (path == "/" ? "" : "/") + choice;
-            }
-            if(M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) return "";
-        }
-    }
-}
-
+// ==========================================
+// EDITOR OPTIMIZADO (NO SE BLOQUEA)
+// ==========================================
 void runEditor(String filepath) {
     fs::FS* fs = getFS(filepath);
-    
     String buffer = "";
+    
+    // Cargar archivo si existe
     if(fs->exists(filepath)) {
         File f = fs->open(filepath, "r");
         while(f.available()) buffer += (char)f.read();
         f.close();
     }
 
-    bool dirty = false;
+    bool dirty = true;     // Redibujar la primera vez
+    bool blinkState = false;
+    unsigned long lastBlink = 0;
+
+    M5Cardputer.Display.fillScreen(BLACK); // Limpiar fondo UNA VEZ
 
     while(true) {
-        M5Cardputer.Display.fillScreen(BLACK);
-        drawStatusBar("EDIT: " + filepath + (dirty?"*":""), dirty ? TFT_ORANGE : TFT_DARKGREY);
-        M5Cardputer.Display.setTextColor(WHITE);
-        M5Cardputer.Display.setCursor(0, 20);
-        M5Cardputer.Display.print(buffer);
-        if((millis()/500)%2==0) M5Cardputer.Display.print("_");
+        // 1. CHEQUEO DE ESTABILIDAD (Dentro del editor también)
+        markSystemStable(); 
 
-        M5Cardputer.update();
+        M5Cardputer.update(); // Leer hardware
+
+        // 2. DETECTAR TECLADO
         if(M5Cardputer.Keyboard.isChange()) {
             if(M5Cardputer.Keyboard.isPressed()) {
                 Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
                 
-                for(auto i : status.word) {
-                    buffer += i; dirty = true;
-                }
+                for(auto i : status.word) { buffer += i; dirty = true; }
+                
                 if(status.del && buffer.length() > 0) {
                     buffer.remove(buffer.length()-1); dirty = true;
                 }
@@ -157,72 +98,108 @@ void runEditor(String filepath) {
                 }
             }
             
+            // GUARDAR / SALIR
             if(M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) {
-                M5Cardputer.Display.fillScreen(BLUE);
-                M5Cardputer.Display.setCursor(10,50);
-                M5Cardputer.Display.println("ENTER: Save\nESC: Discard");
+                M5Cardputer.Display.fillRect(20, 40, 200, 60, BLUE);
+                M5Cardputer.Display.setTextColor(WHITE);
+                M5Cardputer.Display.setCursor(30, 50);
+                M5Cardputer.Display.println("ENTER: Guardar");
+                M5Cardputer.Display.setCursor(30, 70);
+                M5Cardputer.Display.println("ESC: Cancelar");
+                
                 while(true) {
                     M5Cardputer.update();
                     if(M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
                         File f = fs->open(filepath, "w");
                         f.print(buffer); f.close();
+                        M5Cardputer.Display.fillScreen(BLACK);
                         return;
                     }
-                    if(M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) return;
+                    if(M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) {
+                        dirty = true; // Volver a dibujar editor
+                        M5Cardputer.Display.fillScreen(BLACK);
+                        break; 
+                    }
                 }
             }
         }
-        // --- FIX PARPADEO ---
-        delay(50); // Esta pequeña pausa evita que la pantalla se vuelva loca
+
+        // 3. RENDERIZADO INTELIGENTE (Solo si cambia algo)
+        if (dirty) {
+            M5Cardputer.Display.fillRect(0, 18, 240, 117, BLACK); // Borrar solo zona texto
+            drawStatusBar("EDIT: " + filepath, TFT_ORANGE);
+            M5Cardputer.Display.setTextColor(WHITE);
+            M5Cardputer.Display.setCursor(0, 20);
+            M5Cardputer.Display.print(buffer);
+            dirty = false;
+        }
+
+        // 4. CURSOR PARPADEANTE (Sin borrar todo)
+        if (millis() - lastBlink > 500) {
+            lastBlink = millis();
+            blinkState = !blinkState;
+            // Dibujamos el cursor al final del texto (aprox)
+            // Nota: Para un cursor real necesitamos coordenadas, aquí usamos un indicador simple
+            M5Cardputer.Display.fillRect(230, 0, 10, 10, blinkState ? WHITE : TFT_ORANGE);
+        }
+
+        delay(10); // Pausa corta para dejar respirar al I2C
     }
 }
 
 // ==========================================
-// CORE SYSTEM
+// SISTEMA DE SEGURIDAD (CORE 0)
 // ==========================================
-
-void drawStatusBar(String msg, uint16_t color) {
-    M5Cardputer.Display.fillRect(0, 0, 240, 18, color);
-    M5Cardputer.Display.setTextColor(WHITE);
-    M5Cardputer.Display.setCursor(2, 2);
-    M5Cardputer.Display.print(msg);
-}
-
 void checkSystemHealth() {
     crashTracker.begin("sys_health", false);
     int fails = crashTracker.getInt("fails", 0);
+    
+    // Check boton fisico GO (GPIO0)
     pinMode(0, INPUT_PULLUP);
     bool manualOverride = (digitalRead(0) == LOW);
+    
     crashTracker.putInt("fails", fails + 1); 
     
     if (manualOverride || fails >= CRASH_LIMIT) {
-        statusLed.begin(); statusLed.setPixelColor(0, LED_ERR); statusLed.show();
+        statusLed.begin(); statusLed.setPixelColor(0, statusLed.Color(255,0,0)); statusLed.show();
         M5Cardputer.Display.begin(); M5Cardputer.Display.setRotation(1);
         M5Cardputer.Display.fillScreen(RED); M5Cardputer.Display.setTextColor(WHITE);
         M5Cardputer.Display.setTextSize(2); M5Cardputer.Display.setCursor(10, 20);
-        if (manualOverride) M5Cardputer.Display.println("MANUAL RECOVERY");
+        
+        if(manualOverride) M5Cardputer.Display.println("RECOVERY MANUAL");
         else M5Cardputer.Display.println("SYSTEM CRASHED");
+        
         SD.begin(SD_CS_PIN, SPI, 25000000);
         if(SD.exists(RECOVERY_BIN)) {
             crashTracker.putInt("fails", 0); crashTracker.end();
             updateFromFS(SD, RECOVERY_BIN);
         } else {
+             M5Cardputer.Display.println("\nNO recovery.bin");
              while(1); 
         }
     }
     crashTracker.end();
 }
 
-void watchdogTask(void * parameter) {
-    delay(10000);
-    Preferences p; p.begin("sys_health", false); p.putInt("fails", 0); p.end();
-    statusLed.setPixelColor(0, 0); statusLed.show();
-    vTaskDelete(NULL);
+void markSystemStable() {
+    if (!systemStabilized && millis() - bootTime > 10000) {
+        Preferences p; p.begin("sys_health", false);
+        p.putInt("fails", 0); // Reset contador
+        p.end();
+        systemStabilized = true;
+        statusLed.setPixelColor(0, 0); statusLed.show(); // Apagar LED
+    }
 }
 
 // ==========================================
-// COMANDOS
+// COMANDOS & UTILIDADES
 // ==========================================
+void drawStatusBar(String msg, uint16_t color) {
+    M5Cardputer.Display.fillRect(0, 0, 240, 18, color);
+    M5Cardputer.Display.setTextColor(WHITE);
+    M5Cardputer.Display.setCursor(2, 2);
+    M5Cardputer.Display.print(msg);
+}
 
 void cmd_print(String arg) { M5Cardputer.Display.println(arg); }
 void cmd_delay(String arg) { delay(arg.toInt()); }
@@ -232,14 +209,12 @@ void cmd_color(String arg) {
 }
 void cmd_wait(String arg) {
     while(!M5Cardputer.Keyboard.isChange()) {
-        M5Cardputer.update(); delay(50);
+        M5Cardputer.update(); markSystemStable(); delay(20);
         if(M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) break;
     }
 }
 void cmd_load(String arg) {
-    if(!SD.exists(arg)) {
-        M5Cardputer.Display.println("ERR: File not found"); return;
-    }
+    if(!SD.exists(arg)) { M5Cardputer.Display.println("ERR: No File"); return; }
     updateFromFS(SD, arg);
 }
 void cmd_edit(String arg) {
@@ -248,16 +223,17 @@ void cmd_edit(String arg) {
 }
 
 // ==========================================
-// INTERPRETE PRINCIPAL
+// INTERPRETE
 // ==========================================
 void executeScript(String filename) {
-    statusLed.setPixelColor(0, LED_BOOT); statusLed.show();
+    statusLed.setPixelColor(0, statusLed.Color(50,0,50)); statusLed.show();
     File f = LittleFS.open(filename, "r");
     if(!f) f = SD.open(filename, "r");
     
     if(!f) { M5Cardputer.Display.println("Script missing: " + filename); return; }
     
     while(f.available()) {
+        markSystemStable(); // Check estabilidad durante script
         String line = f.readStringUntil('\n');
         line.trim();
         if(line.length() == 0 || line.startsWith("#")) continue;
@@ -268,24 +244,26 @@ void executeScript(String filename) {
         cmd.toUpperCase();
         
         if(cmdMap.count(cmd)) cmdMap[cmd](arg);
-        else M5Cardputer.Display.printf("Unknown: %s\n", cmd.c_str());
     }
     f.close();
-    statusLed.setPixelColor(0, LED_OK); statusLed.show();
+    statusLed.setPixelColor(0, statusLed.Color(0,255,0)); statusLed.show();
 }
 
 // ==========================================
-// MAIN LOOPS
+// MAIN
 // ==========================================
 void setup() {
-    checkSystemHealth();
+    checkSystemHealth(); // Check inicial
+    bootTime = millis(); // Marcar hora de inicio
+
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
     statusLed.begin(); statusLed.setBrightness(20);
     
-    if(!LittleFS.begin(true)) M5Cardputer.Display.println("LFS Fail");
+    if(!LittleFS.begin(true)) M5Cardputer.Display.println("LFS Init");
     SD.begin(SD_CS_PIN, SPI, 25000000);
 
+    // Mapeo
     cmdMap["PRINT"] = &cmd_print;
     cmdMap["DELAY"] = &cmd_delay;
     cmdMap["COLOR"] = &cmd_color;
@@ -293,8 +271,7 @@ void setup() {
     cmdMap["LOAD"]  = &cmd_load;
     cmdMap["EDIT"]  = &cmd_edit;
 
-    xTaskCreatePinnedToCore(watchdogTask, "WDT", 2048, NULL, 1, NULL, 1);
-
+    // Cargar Config
     String autoScript = "";
     File cfgFile = LittleFS.open("/config.json", "r");
     if(cfgFile) {
@@ -313,4 +290,5 @@ void setup() {
 
 void loop() {
     M5Cardputer.update();
+    markSystemStable(); // Check recurrente
 }
