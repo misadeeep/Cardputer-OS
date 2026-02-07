@@ -154,28 +154,54 @@ void checkSystemHealth() {
     crashTracker.begin("sys_health", false);
     int fails = crashTracker.getInt("fails", 0);
     
-    // Check boton fisico GO (GPIO0)
+    // Botón G0 (El botón físico grande junto a la pantalla o BtnA)
     pinMode(0, INPUT_PULLUP);
-    bool manualOverride = (digitalRead(0) == LOW);
+    bool btnPressed = (digitalRead(0) == LOW);
     
+    // Si pulsamos el botón AL ARRANCAR, forzamos el reseteo manual
+    if (btnPressed) {
+        M5Cardputer.Display.begin(); M5Cardputer.Display.setRotation(1);
+        M5Cardputer.Display.fillScreen(BLUE);
+        M5Cardputer.Display.setTextColor(WHITE);
+        M5Cardputer.Display.setTextSize(2);
+        M5Cardputer.Display.setCursor(10, 40);
+        M5Cardputer.Display.println("RESET MANUAL");
+        M5Cardputer.Display.setTextSize(1);
+        M5Cardputer.Display.println("Contador de fallos borrado.");
+        delay(1000);
+        
+        crashTracker.putInt("fails", 0); // <--- AQUÍ BORRAMOS EL REGISTRO
+        crashTracker.end();
+        return; // Salimos de la función y dejamos arrancar normal
+    }
+
+    // Lógica normal de conteo de fallos
     crashTracker.putInt("fails", fails + 1); 
     
-    if (manualOverride || fails >= CRASH_LIMIT) {
+    if (fails >= CRASH_LIMIT) {
         statusLed.begin(); statusLed.setPixelColor(0, statusLed.Color(255,0,0)); statusLed.show();
         M5Cardputer.Display.begin(); M5Cardputer.Display.setRotation(1);
         M5Cardputer.Display.fillScreen(RED); M5Cardputer.Display.setTextColor(WHITE);
         M5Cardputer.Display.setTextSize(2); M5Cardputer.Display.setCursor(10, 20);
+        M5Cardputer.Display.println("SYSTEM CRASHED");
         
-        if(manualOverride) M5Cardputer.Display.println("RECOVERY MANUAL");
-        else M5Cardputer.Display.println("SYSTEM CRASHED");
+        M5Cardputer.Display.setTextSize(1);
+        M5Cardputer.Display.setCursor(10, 50);
+        M5Cardputer.Display.println("Buscando recovery.bin...");
         
         SD.begin(SD_CS_PIN, SPI, 25000000);
         if(SD.exists(RECOVERY_BIN)) {
+            M5Cardputer.Display.println("Restaurando...");
             crashTracker.putInt("fails", 0); crashTracker.end();
             updateFromFS(SD, RECOVERY_BIN);
         } else {
-             M5Cardputer.Display.println("\nNO recovery.bin");
-             while(1); 
+             // --- NUEVA SALIDA DE EMERGENCIA ---
+             M5Cardputer.Display.println("ERROR: No recovery.bin");
+             M5Cardputer.Display.println("\n--- SOLUCION ---");
+             M5Cardputer.Display.println("Manten btn G0 pulsado");
+             M5Cardputer.Display.println("y pulsa RESET (lado)");
+             M5Cardputer.Display.println("para borrar contador.");
+             while(1); // Bloqueo, pero ahora con instrucciones
         }
     }
     crashTracker.end();
