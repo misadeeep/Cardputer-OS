@@ -1,0 +1,8 @@
+COLOR 0000
+PRINT 1. Editar Config
+PRINT 2. Cargar Bruce
+PRINT Elige opcion...
+WAIT
+# Si el usuario pulsa Enter, seguimos.
+# (Para lógica condicional real, usariamos un script por opción en versiones futuras)
+EDIT /config.json
